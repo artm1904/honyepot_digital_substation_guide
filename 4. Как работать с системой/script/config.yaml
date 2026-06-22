@@ -1,0 +1,141 @@
+vms:
+  # =================================================================
+  # 1. СЕНСОРЫ ПРОМЫШЛЕННОГО СЕГМЕНТА СЕТИ ПОДСТАНЦИИ
+  # =================================================================
+  - name: "SENSOR_INDUSTRIAL"
+    interface: "enp1s0"
+    ip: "192.168.1.130/24"
+    gateway: "192.168.1.1"
+    services:
+      - { port: 64295, name: "SSH (Host)" }
+
+  - name: "IED1 (XCBR)"
+    ip: "192.168.1.202"
+    check_only: true
+    services:
+      - { port: 102,   name: "IEC 61850" }
+      - { port: 2222,  name: "SSH service access" }
+      - { port: 80,    name: "HTTP web-interface" }
+
+  - name: "IED2 (PTOC)"
+    ip: "192.168.1.203"
+    check_only: true
+    services:
+      - { port: 102,   name: "IEC 61850" }
+      - { port: 2222,  name: "SSH service access" }
+
+  - name: "IED3 (SMV)"
+    ip: "192.168.1.204"
+    check_only: true
+    services:
+      - { port: 102,   name: "IEC 61850" }
+      - { port: 2222,  name: "SSH service access" }
+
+  - name: "IED4 (SMV)"
+    ip: "192.168.1.205"
+    check_only: true
+    services:
+      - { port: 102,   name: "IEC 61850" }
+      - { port: 2222,  name: "SSH service access" }
+
+  - name: "Simulator"
+    ip: "192.168.1.206"
+    check_only: true
+    services:
+      - { port: 5010,  name: "Web API" }
+
+  - name: "Client (HMI)"
+    ip: "192.168.1.207"
+    check_only: true
+    services:
+      - { port: 21,    name: "FTP" }
+      - { port: 80,    name: "HTTP web-interface" }
+      - { port: 2222,  name: "SSH service access" }
+      - { port: 3389,  name: "RDP" }
+      - { port: 5000,  name: "SCADA-client" }
+      - { port: 5900,  name: "VNC" }
+
+  # =================================================================
+  # 2. СЕНСОРЫ КОРПОРАТИВНОГО СЕГМЕНТА СЕТИ ПОДСТАНЦИИ 
+  # =================================================================
+  - name: "SENSOR_IT"
+    interface: "enp1s0"
+    ip: "192.168.1.120/24"
+    gateway: "192.168.1.1"
+    services:
+      - { port: 64295, name: "SSH (Host)" }
+      - { port: 22,    name: "SSH" }
+      - { port: 23,    name: "Telnet" }
+      - { port: 8080,  name: "HTTP" }
+      - { port: 110,   name: "POP3" }
+      - { port: 143,   name: "IMAP" }
+      - { port: 465,   name: "SMTPS" }
+      - { port: 993,   name: "IMAPS" }
+      - { port: 1080,  name: "SOCKS" }
+      - { port: 5432,  name: "PGSQL" }
+      - { port: 5900,  name: "VNC" }
+
+  - name: "Infraserv-DC01"
+    ip: "192.168.1.210"
+    check_only: true
+    services:
+      - { port: 53,    name: "DNS (TCP)" }
+      - { port: 389,   name: "LDAP" }
+
+  - name: "Mail-Srv"
+    ip: "192.168.1.211"
+    check_only: true
+    services:
+      - { port: 22,    name: "SSH" }
+      - { port: 25,    name: "SMTP" }
+      - { port: 80,    name: "HTTP" }
+      - { port: 110,   name: "POP3" }
+      - { port: 143,   name: "IMAP" }
+      - { port: 443,   name: "HTTPS" }
+      - { port: 465,   name: "SMTPS" }
+      - { port: 993,   name: "IMAPS" }
+
+  - name: "App-DB-Srv"
+    ip: "192.168.1.212"
+    check_only: true
+    services:
+      - { port: 21,    name: "FTP" }
+      - { port: 80,    name: "HTTP" }
+      - { port: 443,   name: "HTTPS" }
+      - { port: 5432,  name: "PostgreSQL" }
+
+  - name: "Gateway-Edge"
+    ip: "192.168.1.213"
+    check_only: true
+    services:
+      - { port: 22,    name: "SSH" }
+      - { port: 80,    name: "HTTP" }
+      - { port: 443,   name: "HTTPS" }
+      - { port: 8443,  name: "Alt HTTPS" }
+
+  - name: "HP-LaserJet"
+    ip: "192.168.1.214"
+    check_only: true
+    services:
+      - { port: 80,    name: "HTTP" }
+      - { port: 631,   name: "IPP (Printer)" }
+      - { port: 9100,  name: "JetDirect" }
+
+  - name: "Admin-PC"
+    ip: "192.168.1.215"
+    check_only: true
+    services:
+      - { port: 80,    name: "HTTP" }
+      - { port: 3389,  name: "RDP" }
+
+  # =================================================================
+  # 3. ЦЕНТРАЛЬНЫЙ УЗЕЛ СБОРА ДАННЫХ И УПРАВЛЕНИЯ 
+  # =================================================================
+  - name: "HIVE"
+    interface: "enp1s0"
+    ip: "192.168.1.192/24"
+    gateway: "192.168.1.1"
+    services:
+      - { port: 64295, name: "SSH (Host)" }
+      - { port: 64294, name: "Web UI" }
+      - { port: 64297, name: "Admin UI" }
