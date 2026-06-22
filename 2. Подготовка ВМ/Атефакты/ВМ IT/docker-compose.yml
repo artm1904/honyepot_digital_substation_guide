@@ -1,0 +1,420 @@
+# T-Pot: SENSOR
+networks:
+
+  cowrie_local:
+  dionaea_local:
+  heralding_local:
+  wordpot_local:
+
+  scada_macvlan:
+    driver: macvlan
+    driver_opts:
+      parent: enp1s0 # Замените на ваш реальный интерфейс, если он другой
+      macvlan_mode: bridge  
+    ipam:
+      config:
+         - subnet: "192.168.1.0/24"      
+           gateway: "192.168.1.1"        
+           ip_range: "192.168.1.200/29"  # Диапазон для T-Pot
+
+
+
+
+
+# Шаблон настроек для универсального ханипота
+x-honeypots-base: &honeypots-base
+  image: ${TPOT_REPO}/honeypots:${TPOT_VERSION}
+  pull_policy: ${TPOT_PULL_POLICY}
+  restart: always
+  stdin_open: true
+  tty: true
+  read_only: true
+  tmpfs:
+    - /tmp:uid=2000,gid=2000
+
+
+
+services:
+
+#########################################
+#### DEV
+#########################################
+#### T-Pot Init - Never delete this!
+#########################################
+
+# T-Pot Init Service
+  tpotinit:
+    container_name: tpotinit
+    env_file:
+      - .env
+    restart: always
+    stop_grace_period: 60s
+    tmpfs:
+      - /tmp/etc:uid=2000,gid=2000
+      - /tmp/:uid=2000,gid=2000
+    network_mode: "host"
+    cap_add:
+     - NET_ADMIN
+    image: ${TPOT_REPO}/tpotinit:${TPOT_VERSION}
+    pull_policy: ${TPOT_PULL_POLICY}
+    volumes:
+      - ${TPOT_DOCKER_COMPOSE}:/tmp/tpot/docker-compose.yml:ro
+      - ${TPOT_DATA_PATH}/blackhole:/etc/blackhole
+      - ${TPOT_DATA_PATH}:/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+
+
+#########################################
+#### 🌐 СЕТЕВЫЕ СУЩНОСТИ УСТРОЙСТВ С ФАЕРВОЛАМИ
+#########################################
+
+  net_infraserv:
+    build:
+        context: .
+        dockerfile: Dockerfile.firewall
+    container_name: Infraserv-DC01
+    cap_add: [NET_ADMIN, NET_RAW]
+    networks:
+      scada_macvlan: { ipv4_address: 192.168.1.210 }
+    command: >
+      /bin/sh -c "
+      iptables -F && iptables -P INPUT DROP &&
+      iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT && iptables -A INPUT -i lo -j ACCEPT && iptables -A INPUT -p icmp -j ACCEPT &&
+      iptables -A INPUT -p udp -m multiport --dports 53,67,123,161 -j ACCEPT &&
+      iptables -A INPUT -p tcp -m multiport --dports 53,389 -j ACCEPT &&
+      sleep infinity
+      "
+
+  net_mailsrv:
+    build:
+        context: .
+        dockerfile: Dockerfile.firewall
+    container_name: Mail-Srv
+    cap_add: [NET_ADMIN, NET_RAW]
+    networks:
+      scada_macvlan: { ipv4_address: 192.168.1.211 }
+    command: >
+      /bin/sh -c "
+      iptables -F && iptables -t nat -F && iptables -P INPUT DROP &&
+      iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT && iptables -A INPUT -i lo -j ACCEPT && iptables -A INPUT -p icmp -j ACCEPT &&
+      iptables -A INPUT -p tcp -m multiport --dports 22,25,80,110,143,443,465,993 -j ACCEPT &&
+      iptables -t nat -A PREROUTING -p tcp --dport 465 -j REDIRECT --to-ports 25 &&
+      iptables -t nat -A PREROUTING -p tcp --dport 993 -j REDIRECT --to-ports 143 &&
+      sleep infinity
+      "
+
+  net_appdbsrv:
+    build:
+        context: .
+        dockerfile: Dockerfile.firewall
+    container_name: App-DB-Srv
+    cap_add: [NET_ADMIN, NET_RAW]
+    networks:
+      scada_macvlan: { ipv4_address: 192.168.1.212 }
+    command: >
+      /bin/sh -c "
+      iptables -F && iptables -P INPUT DROP &&
+      iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT && iptables -A INPUT -i lo -j ACCEPT && iptables -A INPUT -p icmp -j ACCEPT &&
+      iptables -A INPUT -p udp -m multiport --dports 161 -j ACCEPT &&
+      iptables -A INPUT -p tcp -m multiport --dports 21,80,443,5432 -j ACCEPT &&
+      sleep infinity
+      "
+
+  net_gatewayedge:
+    build:
+        context: .
+        dockerfile: Dockerfile.firewall
+    container_name: Gateway-Edge
+    cap_add: [NET_ADMIN, NET_RAW]
+    networks:
+      scada_macvlan: { ipv4_address: 192.168.1.213 }
+    command: >
+      /bin/sh -c "
+      iptables -F && iptables -P INPUT DROP &&
+      iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT && iptables -A INPUT -i lo -j ACCEPT && iptables -A INPUT -p icmp -j ACCEPT &&
+      iptables -A INPUT -p udp -m multiport --dports 161,5000 -j ACCEPT &&
+      iptables -A INPUT -p tcp -m multiport --dports 22,80,443,8443 -j ACCEPT &&
+      sleep infinity
+      "
+
+  net_hplaserjet:
+    build:
+        context: .
+        dockerfile: Dockerfile.firewall
+    container_name: HP-LaserJet-VAPS
+    cap_add: [NET_ADMIN, NET_RAW]
+    networks:
+      scada_macvlan: { ipv4_address: 192.168.1.214 }
+    command: >
+      /bin/sh -c "
+      iptables -F && iptables -P INPUT DROP &&
+      iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT && iptables -A INPUT -i lo -j ACCEPT && iptables -A INPUT -p icmp -j ACCEPT &&
+      iptables -A INPUT -p tcp -m multiport --dports 80,631,9100 -j ACCEPT &&
+      sleep infinity
+      "
+
+  net_adminpc:
+    build:
+        context: .
+        dockerfile: Dockerfile.firewall
+    container_name: Admin-PC
+    cap_add: [NET_ADMIN, NET_RAW]
+    networks:
+      scada_macvlan: { ipv4_address: 192.168.1.215 }
+    command: >
+      /bin/sh -c "
+      iptables -F && iptables -P INPUT DROP &&
+      iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT && iptables -A INPUT -i lo -j ACCEPT && iptables -A INPUT -p icmp -j ACCEPT &&
+      iptables -A INPUT -p tcp -m multiport --dports 80,3389 -j ACCEPT &&
+      sleep infinity
+      "
+
+##################
+#### Honeypots
+##################
+
+ 
+#########################################
+#### 🖥️ ХАНИПОТЫ (ПРИВЯЗАННЫЕ К СЕТЯМ)
+#########################################
+
+  # 1. Infraserv-DC01 (LDAP, DNS, DHCP, NTP, SNMP)
+  infraserv_hp:
+    <<: *honeypots-base
+    container_name: infraserv_honeypots
+    depends_on: [tpotinit, net_infraserv]
+    network_mode: "service:net_infraserv"
+    volumes:
+     - ${TPOT_DATA_PATH}/Infraserv-DC01/honeypots/log:/var/log/honeypots
+
+
+  # 2. Mail-Srv (SMTP, IMAP, POP3, HTTP/S, SSH)
+  mailsrv_hp:
+    <<: *honeypots-base
+    container_name: mailsrv_honeypots
+    depends_on: [tpotinit, net_mailsrv]
+    network_mode: "service:net_mailsrv"
+    volumes:
+     - ${TPOT_DATA_PATH}/Mail-Srv/honeypots/log:/var/log/honeypots
+
+  # 3. App-DB-Srv (Postgres, HTTP/S, FTP, SNMP)
+  appdb_hp:
+    <<: *honeypots-base
+    container_name: appdb_honeypots
+    depends_on: [tpotinit, net_appdbsrv]
+    network_mode: "service:net_appdbsrv"
+    volumes:
+     - ${TPOT_DATA_PATH}/App-DB-Srv/honeypots/log:/var/log/honeypots
+
+  # 4. Gateway-Edge (SSH, SNMP, HTTP/S)
+  gateway_hp:
+    <<: *honeypots-base
+    container_name: gateway_honeypots
+    depends_on: [tpotinit, net_gatewayedge]
+    network_mode: "service:net_gatewayedge"
+    volumes:
+     - ${TPOT_DATA_PATH}/Gateway-Edge/honeypots/log:/var/log/honeypots
+
+  gateway_ciscoasa:
+      container_name: gateway_ciscoasa
+      restart: always
+      depends_on: [tpotinit, net_gatewayedge]
+      network_mode: "service:net_gatewayedge"
+      image: ${TPOT_REPO}/ciscoasa:${TPOT_VERSION}
+      pull_policy: ${TPOT_PULL_POLICY}
+      read_only: true  # Обязательно для безопасности T-Pot
+      tmpfs:           # Обязательно для запуска
+       - /tmp/ciscoasa:uid=2000,gid=2000
+      volumes:
+       - ${TPOT_DATA_PATH}/Gateway-Edge/ciscoasa/log:/var/log/ciscoasa
+
+  # 5. HP-LaserJet-VAPS (Printer 9100, IPP 631, HTTP)
+  printer_hp:
+    <<: *honeypots-base
+    container_name: printer_honeypots
+    depends_on: [tpotinit, net_hplaserjet]
+    network_mode: "service:net_hplaserjet"
+    volumes:
+     - ${TPOT_DATA_PATH}/HP-LaserJet-VAPS/honeypots/log:/var/log/honeypots
+
+  # 6. Admin-PC (RDP, HTTP)
+  adminpc_hp:
+    <<: *honeypots-base
+    container_name: adminpc_honeypots
+    depends_on: [tpotinit, net_adminpc]
+    network_mode: "service:net_adminpc"
+    volumes:
+     - ${TPOT_DATA_PATH}/Admin-PC/honeypots/log:/var/log/honeypots
+
+
+
+
+
+
+# Cowrie service
+  cowrie:
+    container_name: cowrie
+    restart: always
+    depends_on:
+      tpotinit:
+        condition: service_healthy
+    tmpfs:
+      - /tmp/cowrie:uid=2000,gid=2000
+      - /tmp/cowrie/data:uid=2000,gid=2000
+    networks:
+      - cowrie_local
+    ports:
+      - "22:22"
+      - "23:23"
+    image: ${TPOT_REPO}/cowrie:${TPOT_VERSION} 
+    pull_policy: ${TPOT_PULL_POLICY}
+    read_only: true
+    volumes:
+      - ${TPOT_DATA_PATH}/cowrie/downloads:/home/cowrie/cowrie/dl
+      - ${TPOT_DATA_PATH}/cowrie/keys:/home/cowrie/cowrie/etc
+      - ${TPOT_DATA_PATH}/cowrie/log:/home/cowrie/cowrie/log
+      - ${TPOT_DATA_PATH}/cowrie/log/tty:/home/cowrie/cowrie/log/tty
+
+
+
+# Heralding service
+  heralding:
+    container_name: heralding
+    restart: always
+    depends_on:
+      tpotinit:
+        condition: service_healthy
+    tmpfs:
+     - /tmp/heralding:uid=2000,gid=2000
+    networks:
+     - heralding_local
+    ports:
+    # - "21:21"
+    # - "22:22"
+    # - "23:23"
+    # - "25:25"
+    # - "80:80"
+     - "110:110"
+     - "143:143"
+    # - "443:443"
+     - "465:465"
+     - "993:993"
+     - "995:995"
+    # - "3306:3306"
+    # - "3389:3389"
+     - "1080:1080"
+     - "5432:5432"
+     - "5900:5900"
+    image: ${TPOT_REPO}/heralding:${TPOT_VERSION}
+    pull_policy: ${TPOT_PULL_POLICY}
+    read_only: true
+    volumes:
+     - ${TPOT_DATA_PATH}/heralding/log:/var/log/heralding
+
+
+# Wordpot service
+  wordpot:
+    container_name: wordpot
+    restart: always
+    depends_on:
+      tpotinit:
+        condition: service_healthy
+    networks:
+     - wordpot_local
+    ports:
+     - "8080:80"
+    image: ${TPOT_REPO}/wordpot:${TPOT_VERSION}
+    pull_policy: ${TPOT_PULL_POLICY}
+    read_only: true
+    volumes:
+     - ${TPOT_DATA_PATH}/wordpot/log:/opt/wordpot/logs/
+
+
+
+##################
+#### NSM
+##################
+
+# Fatt service
+  fatt:
+    container_name: fatt
+    restart: always
+    depends_on:
+      tpotinit:
+        condition: service_healthy
+    network_mode: "host"
+    cap_add:
+     - NET_ADMIN
+     - SYS_NICE
+     - NET_RAW
+    image: ${TPOT_REPO}/fatt:${TPOT_VERSION}
+    pull_policy: ${TPOT_PULL_POLICY}
+    volumes:
+     - ${TPOT_DATA_PATH}/fatt/log:/opt/fatt/log
+
+# P0f service
+  p0f:
+    container_name: p0f
+    restart: always
+    depends_on:
+      tpotinit:
+        condition: service_healthy
+    network_mode: "host"
+    image: ${TPOT_REPO}/p0f:${TPOT_VERSION}
+    pull_policy: ${TPOT_PULL_POLICY}
+    read_only: true
+    volumes:
+     - ${TPOT_DATA_PATH}/p0f/log:/var/log/p0f
+
+# Suricata service
+  suricata:
+    container_name: suricata
+    restart: always
+    depends_on:
+      tpotinit:
+        condition: service_healthy
+    environment:
+     - OINKCODE=${OINKCODE:-OPEN} # Default to OPEN if unset or NULL (value provided by T-Pot .env)
+    # Loading external Rules from URL
+    # - FROMURL="https://username:password@yoururl.com|https://username:password@otherurl.com"
+    network_mode: "host"
+    cap_add:
+     - NET_ADMIN
+     - SYS_NICE
+     - NET_RAW
+    image: ${TPOT_REPO}/suricata:${TPOT_VERSION}
+    pull_policy: ${TPOT_PULL_POLICY}
+    volumes:
+     - ${TPOT_DATA_PATH}/suricata/log:/var/log/suricata
+
+
+##################
+#### Tools 
+##################
+
+#### ELK
+
+## Logstash service
+  logstash:
+    container_name: logstash
+    restart: always
+    depends_on:
+      tpotinit:
+        condition: service_healthy
+    environment:
+     - LS_JAVA_OPTS=-Xms1024m -Xmx1024m
+     - TPOT_TYPE=${TPOT_TYPE:-HIVE}
+     - TPOT_HIVE_USER=${TPOT_HIVE_USER}
+     - TPOT_HIVE_IP=${TPOT_HIVE_IP}
+     - LS_SSL_VERIFICATION=${LS_SSL_VERIFICATION:-full}
+    ports:
+     - "127.0.0.1:64305:64305"
+    mem_limit: 2g
+    image: ${TPOT_REPO}/logstash:${TPOT_VERSION}
+    pull_policy: ${TPOT_PULL_POLICY}
+    volumes:
+     - ${TPOT_DATA_PATH}:/data
+     - /home/artm1904/custom_http_output.conf:/etc/logstash/http_output.conf:ro
+
+#### /ELK

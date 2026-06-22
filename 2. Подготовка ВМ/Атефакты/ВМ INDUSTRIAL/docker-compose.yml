@@ -1,0 +1,664 @@
+# T-Pot: SENSOR
+networks:
+
+  subnetwork1:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.0.0.0/24
+
+
+  # Macvlan сеть для IEC_61850
+  # Сеть 1: Шина Станции (Station Bus)
+  scada_macvlan:
+      driver: macvlan
+      driver_opts:
+        parent: enp1s0 #для Station Bus
+        macvlan_mode: bridge  
+      ipam:
+        config:
+           - subnet: "192.168.1.0/24"      # реальная подсеть
+             gateway: "192.168.1.1"        # реальный роутер
+             ip_range: "192.168.1.200/29"  # Резервируем кусок адресов для Докера 
+
+
+
+# --- Создаем шаблон настроек для Beelzebub ---
+x-beelzebub-settings: &beelzebub-settings
+  environment:
+    - LLM_MODEL=ollama
+    - LLM_HOST=http://192.168.1.173:11434
+    - OLLAMA_HOST=http://192.168.1.173:11434
+    - OLLAMA_URL=http://192.168.1.173:11434
+    - OLLAMA_MODEL=llama3.1:8b
+    - OPENAI_API_KEY=sk-ollama
+  volumes:
+    # Волюмы для Beelzebub (убедитесь, что пути правильные)
+    - /home/artm1904/substation_honeypot/llm_honeypot/configurations/services:/opt/beelzebub/configurations/services:ro
+    - /home/artm1904/substation_honeypot/llm_honeypot/industrial-samples/rag-knowledge:/opt/beelzebub/industrial-samples/rag-knowledge
+
+    
+
+# --- Шаблон настроек для универсального ханипота ---
+x-honeypots-base: &honeypots-base
+  image: ${TPOT_REPO}/honeypots:${TPOT_VERSION}
+  pull_policy: ${TPOT_PULL_POLICY}
+  restart: always
+  stdin_open: true
+  tty: true
+  read_only: true
+  tmpfs:
+    - /tmp:uid=2000,gid=2000
+
+        
+
+services:
+
+#########################################
+#### DEV
+#########################################
+#### T-Pot Init - Never delete this!
+#########################################
+
+# T-Pot Init Service
+  tpotinit:
+    container_name: tpotinit
+    env_file:
+      - .env
+    restart: always
+    stop_grace_period: 60s
+    tmpfs:
+      - /tmp/etc:uid=2000,gid=2000
+      - /tmp/:uid=2000,gid=2000
+    network_mode: "host"
+    cap_add:
+     - NET_ADMIN
+    image: ${TPOT_REPO}/tpotinit:${TPOT_VERSION}
+    pull_policy: ${TPOT_PULL_POLICY}
+    volumes:
+      - ${TPOT_DOCKER_COMPOSE}:/tmp/tpot/docker-compose.yml:ro
+      - ${TPOT_DATA_PATH}/blackhole:/etc/blackhole
+      - ${TPOT_DATA_PATH}:/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+
+
+      
+
+##################
+#### Honeypots
+##################
+
+
+#######################
+### Substation's vIED
+#######################
+
+
+  ied1_xcbr:
+    image: iec61850_vied_honeypot-ied1_xcbr:latest
+    container_name: ied1_xcbr
+    hostname: IED1_XCBR
+    privileged: true
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN  # Обязательно для работы iptables внутри
+    restart: always
+    
+    networks:
+        subnetwork1:
+            ipv4_address: 10.0.0.2   # eth0 (Внутренняя сеть для симулятора и внутренних скрытых сервисов)
+        scada_macvlan:
+            ipv4_address: 192.168.1.202      # Внешний IP (Для хакера)
+    
+    volumes:
+      # логи iec61850    
+      - /home/artm1904/substation_honeypot/iec61850_vIED_honeypot/cfg:/cfg:ro
+      - ${TPOT_DATA_PATH}/substation/log/ied1_xcbr/:/var/log/tpot
+      # логи beelzebub (ssh, web-server)
+      - ${TPOT_DATA_PATH}/substation/log/ied1_xcbr/key:/opt/beelzebub/configurations/key
+      - ${TPOT_DATA_PATH}/substation/log/ied1_xcbr/log:/opt/beelzebub/configurations/log
+
+   
+    command: |
+          /bin/sh -c "
+          # 1. ДИНАМИЧЕСКИЙ ПОИСК ИНТЕРФЕЙСОВ
+          DEV_INT=$$(ip -o -4 addr show | grep '10.0.0.2' | awk '{print $$2}') &&
+          DEV_EXT=$$(ip -o -4 addr show | grep '192.168.1.202' | awk '{print $$2}') &&
+          
+          echo \"Detected Interfaces -> Internal: $$DEV_INT, External: $$DEV_EXT\" &&
+          
+          # Разрешаем интерфейсам принимать мультикаст (GOOSE/SV)
+          ip link set $$DEV_INT promisc on &&
+          ip link set $$DEV_EXT promisc on &&
+
+
+          # ====================================================
+          # ВНУТРЕННИЙ ФАЕРВОЛ (Ограничиваем видимость для хакера)
+          # ====================================================
+          iptables -F &&
+          iptables -P INPUT DROP &&
+          iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
+          iptables -A INPUT -i lo -j ACCEPT &&
+          iptables -A INPUT -i $$DEV_INT -j ACCEPT && # Полностью доверяем внутренней сети симулятора
+          iptables -A INPUT -i $$DEV_EXT -p icmp -j ACCEPT && # Разрешаем пинг снаружи
+          iptables -A INPUT -i $$DEV_EXT -p udp -m multiport --dports 123,161 -j ACCEPT && # UDP: NTP, SNMP
+          iptables -A INPUT -i $$DEV_EXT -p tcp -m multiport --dports 21,2222,80,102 -j ACCEPT && # TCP: FTP, SSH, HTTP, IEC61850 (102)
+          # ====================================================
+
+         
+          # 2. АТАКИ СНАРУЖИ: Перехватываем входящий (ingress) трафик от хакера (DEV_EXT) и копируем внутрь (DEV_INT)
+          tc qdisc add dev $$DEV_EXT handle ffff: ingress &&
+          tc filter add dev $$DEV_EXT parent ffff: protocol all u32 match u16 0x88b8 0xffff at 12 action mirred egress mirror dev $$DEV_INT &&
+          tc filter add dev $$DEV_EXT parent ffff: protocol all u32 match u16 0x88ba 0xffff at 12 action mirred egress mirror dev $$DEV_INT &&
+          
+          # 3. ОТВЕТЫ/ТРАФИК ИЗНУТРИ: Перехватываем исходящий (egress) трафик симулятора (DEV_INT) и копируем наружу (DEV_EXT)
+          tc qdisc add dev $$DEV_INT handle 1: root prio &&
+          tc filter add dev $$DEV_INT parent 1: protocol all u32 match u16 0x88b8 0xffff at 12 action mirred egress mirror dev $$DEV_EXT &&
+          tc filter add dev $$DEV_INT parent 1: protocol all u32 match u16 0x88ba 0xffff at 12 action mirred egress mirror dev $$DEV_EXT &&
+          
+          # 4. ЗАПУСК СЕРВЕРА (Привязываем к внутреннему интерфейсу)
+          # TCP порт 102 откроется везде автоматически (0.0.0.0)
+          /srv/libiec61850_server $$DEV_EXT 102 /cfg/IED1_XCBR.cfg /cfg/IED1_XCBR.ext R
+          "
+
+
+
+
+  ied2_ptoc:
+    image: iec61850_vied_honeypot-ied2_ptoc:latest 
+    container_name: ied2_ptoc
+    hostname: IED2_PTOC
+    privileged: true
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN  # Обязательно для работы iptables внутри
+    restart: always
+        
+    networks:
+        subnetwork1:
+            ipv4_address: 10.0.0.3   # eth0 (Внутренняя сеть для симулятора и внутренних скрытых сервисов)
+        scada_macvlan:
+            ipv4_address: 192.168.1.203      # eth1 (Шина Станции)
+
+
+    volumes:
+          - /home/artm1904/substation_honeypot/iec61850_vIED_honeypot/cfg:/cfg:ro
+          - ${TPOT_DATA_PATH}/substation/log/ied2_ptoc/:/var/log/tpot
+          # логи beelzebub (ssh, web-server)
+          - ${TPOT_DATA_PATH}/substation/log/ied2_ptoc/key:/opt/beelzebub/configurations/key
+          - ${TPOT_DATA_PATH}/substation/log/ied2_ptoc/log:/opt/beelzebub/configurations/log
+
+          # ПЕРЕНОСИМ ВОЛЮМЫ БЕЛЬЗЕВУБА СЮДА:
+          - /home/artm1904/substation_honeypot/llm_honeypot/configurations/services:/opt/beelzebub/configurations/services:ro
+          - /home/artm1904/substation_honeypot/llm_honeypot/industrial-samples/rag-knowledge:/opt/beelzebub/industrial-samples/rag-knowledge:ro
+
+    <<: *beelzebub-settings # Подключаем шаблон сюда
+
+    command: |
+               /bin/sh -c "
+               # 1. ДИНАМИЧЕСКИЙ ПОИСК ИНТЕРФЕЙСОВ
+               DEV_INT=$$(ip -o -4 addr show | grep '10.0.0.3' | awk '{print $$2}') &&
+               DEV_EXT=$$(ip -o -4 addr show | grep '192.168.1.203' | awk '{print $$2}') &&
+               
+               echo \"Detected Interfaces -> Internal: $$DEV_INT, External: $$DEV_EXT\" &&
+               
+               # Разрешаем интерфейсам принимать мультикаст (GOOSE/SV)
+               ip link set $$DEV_INT promisc on &&
+               ip link set $$DEV_EXT promisc on &&
+
+               # ====================================================
+               # ВНУТРЕННИЙ ФАЕРВОЛ (Ограничиваем видимость для хакера)
+               # ====================================================
+               iptables -F &&
+               iptables -P INPUT DROP &&
+               iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
+               iptables -A INPUT -i lo -j ACCEPT &&
+               iptables -A INPUT -i $$DEV_INT -j ACCEPT && # Полностью доверяем внутренней сети симулятора
+               iptables -A INPUT -i $$DEV_EXT -p icmp -j ACCEPT && # Разрешаем пинг снаружи
+               iptables -A INPUT -i $$DEV_EXT -p udp -m multiport --dports 123,161 -j ACCEPT && # UDP: NTP, SNMP
+               iptables -A INPUT -i $$DEV_EXT -p tcp -m multiport --dports 21,2222,80,102 -j ACCEPT && # TCP: FTP, SSH, HTTP, IEC61850 (102)
+               # ====================================================
+                               
+               
+               # 2. АТАКИ СНАРУЖИ: Перехватываем входящий (ingress) трафик от хакера (DEV_EXT) и копируем внутрь (DEV_INT)
+               tc qdisc add dev $$DEV_EXT handle ffff: ingress &&
+               tc filter add dev $$DEV_EXT parent ffff: protocol all u32 match u16 0x88b8 0xffff at 12 action mirred egress mirror dev $$DEV_INT &&
+               tc filter add dev $$DEV_EXT parent ffff: protocol all u32 match u16 0x88ba 0xffff at 12 action mirred egress mirror dev $$DEV_INT &&
+               
+               # 3. ОТВЕТЫ/ТРАФИК ИЗНУТРИ: Перехватываем исходящий (egress) трафик симулятора (DEV_INT) и копируем наружу (DEV_EXT)
+               tc qdisc add dev $$DEV_INT handle 1: root prio &&
+               tc filter add dev $$DEV_INT parent 1: protocol all u32 match u16 0x88b8 0xffff at 12 action mirred egress mirror dev $$DEV_EXT &&
+               tc filter add dev $$DEV_INT parent 1: protocol all u32 match u16 0x88ba 0xffff at 12 action mirred egress mirror dev $$DEV_EXT &&
+               
+               # 4. ЗАПУСК СЕРВЕРА (Привязываем к внутреннему интерфейсу)
+               # TCP порт 102 откроется везде автоматически (0.0.0.0)
+               /srv/libiec61850_server $$DEV_EXT 102 /cfg/IED2_PTOC.cfg /cfg/IED2_PTOC.ext R
+               "
+    
+
+
+
+  ied3_smv:
+    image: iec61850_vied_honeypot-ied3_smv:latest
+    container_name: ied3_smv
+    hostname: IED3_SMV
+    privileged: true
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN  # Обязательно для работы iptables внутри
+    restart: always
+    
+    networks:
+        subnetwork1:
+            ipv4_address: 10.0.0.4   # eth0 (Внутренняя сеть для симулятора и внутренних скрытых сервисов)
+        scada_macvlan:
+            ipv4_address: 192.168.1.204      # eth1 (Шина Станции)
+    
+    volumes:
+      - /home/artm1904/substation_honeypot/iec61850_vIED_honeypot/cfg:/cfg:ro
+      - ${TPOT_DATA_PATH}/substation/log/ied3_smv/:/var/log/tpot
+      # логи beelzebub (ssh, web-server)
+      - ${TPOT_DATA_PATH}/substation/log/ied3_smv/key:/opt/beelzebub/configurations/key
+      - ${TPOT_DATA_PATH}/substation/log/ied3_smv/log:/opt/beelzebub/configurations/log
+
+
+    command: |
+          /bin/sh -c "
+          # 1. ДИНАМИЧЕСКИЙ ПОИСК ИНТЕРФЕЙСОВ
+          DEV_INT=$$(ip -o -4 addr show | grep '10.0.0.4' | awk '{print $$2}') &&
+          DEV_EXT=$$(ip -o -4 addr show | grep '192.168.1.204' | awk '{print $$2}') &&
+          
+          echo \"Detected Interfaces -> Internal: $$DEV_INT, External: $$DEV_EXT\" &&
+          
+          # Разрешаем интерфейсам принимать мультикаст (GOOSE/SV)
+          ip link set $$DEV_INT promisc on &&
+          ip link set $$DEV_EXT promisc on &&
+
+
+          # ====================================================
+          # ВНУТРЕННИЙ ФАЕРВОЛ (Ограничиваем видимость для хакера)
+          # ====================================================
+          iptables -F &&
+          iptables -P INPUT DROP &&
+          iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
+          iptables -A INPUT -i lo -j ACCEPT &&
+          iptables -A INPUT -i $$DEV_INT -j ACCEPT && # Полностью доверяем внутренней сети симулятора
+          iptables -A INPUT -i $$DEV_EXT -p icmp -j ACCEPT && # Разрешаем пинг снаружи
+          iptables -A INPUT -i $$DEV_EXT -p udp -m multiport --dports 123,161 -j ACCEPT && # UDP: NTP, SNMP
+          iptables -A INPUT -i $$DEV_EXT -p tcp -m multiport --dports 21,2222,80,102 -j ACCEPT && # TCP: FTP, SSH, HTTP, IEC61850 (102)
+          # ====================================================
+
+
+          
+          # 2. АТАКИ СНАРУЖИ: Перехватываем входящий (ingress) трафик от хакера (DEV_EXT) и копируем внутрь (DEV_INT)
+          tc qdisc add dev $$DEV_EXT handle ffff: ingress &&
+          tc filter add dev $$DEV_EXT parent ffff: protocol all u32 match u16 0x88b8 0xffff at 12 action mirred egress mirror dev $$DEV_INT &&
+          tc filter add dev $$DEV_EXT parent ffff: protocol all u32 match u16 0x88ba 0xffff at 12 action mirred egress mirror dev $$DEV_INT &&
+          
+          # 3. ОТВЕТЫ/ТРАФИК ИЗНУТРИ: Перехватываем исходящий (egress) трафик симулятора (DEV_INT) и копируем наружу (DEV_EXT)
+          tc qdisc add dev $$DEV_INT handle 1: root prio &&
+          tc filter add dev $$DEV_INT parent 1: protocol all u32 match u16 0x88b8 0xffff at 12 action mirred egress mirror dev $$DEV_EXT &&
+          tc filter add dev $$DEV_INT parent 1: protocol all u32 match u16 0x88ba 0xffff at 12 action mirred egress mirror dev $$DEV_EXT &&
+          
+          # 4. ЗАПУСК СЕРВЕРА (Привязываем к внутреннему интерфейсу)
+          # TCP порт 102 откроется везде автоматически (0.0.0.0)
+          /srv/libiec61850_server $$DEV_EXT 102 /cfg/IED3_SMV.cfg /cfg/IED3_SMV.ext R
+          "
+
+
+
+
+  ied4_smv:
+    image: iec61850_vied_honeypot-ied4_smv:latest
+    container_name: ied4_smv
+    hostname: IED4_SMV
+    privileged: true
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN  # Обязательно для работы iptables внутри
+    restart: always
+    
+    networks:
+        subnetwork1:
+            ipv4_address: 10.0.0.5   # eth0 (Внутренняя сеть для симулятора и внутренних скрытых сервисов)
+        scada_macvlan:
+            ipv4_address: 192.168.1.205      # eth1 (Шина Станции)
+    
+    volumes:
+      - /home/artm1904/substation_honeypot/iec61850_vIED_honeypot/cfg:/cfg:ro
+      - ${TPOT_DATA_PATH}/substation/log/ied4_smv/:/var/log/tpot
+      # логи beelzebub (ssh, web-server)
+      - ${TPOT_DATA_PATH}/substation/log/ied4_smv/key:/opt/beelzebub/configurations/key
+      - ${TPOT_DATA_PATH}/substation/log/ied4_smv/log:/opt/beelzebub/configurations/log
+
+
+    command: |
+          /bin/sh -c "
+          # 1. ДИНАМИЧЕСКИЙ ПОИСК ИНТЕРФЕЙСОВ
+          DEV_INT=$$(ip -o -4 addr show | grep '10.0.0.5' | awk '{print $$2}') &&
+          DEV_EXT=$$(ip -o -4 addr show | grep '192.168.1.205' | awk '{print $$2}') &&
+          
+          echo \"Detected Interfaces -> Internal: $$DEV_INT, External: $$DEV_EXT\" &&
+          
+          # Разрешаем интерфейсам принимать мультикаст (GOOSE/SV)
+          ip link set $$DEV_INT promisc on &&
+          ip link set $$DEV_EXT promisc on &&
+
+
+          # ====================================================
+          # ВНУТРЕННИЙ ФАЕРВОЛ (Ограничиваем видимость для хакера)
+          # ====================================================
+          iptables -F &&
+          iptables -P INPUT DROP &&
+          iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
+          iptables -A INPUT -i lo -j ACCEPT &&
+          iptables -A INPUT -i $$DEV_INT -j ACCEPT && # Полностью доверяем внутренней сети симулятора
+          iptables -A INPUT -i $$DEV_EXT -p icmp -j ACCEPT && # Разрешаем пинг снаружи
+          iptables -A INPUT -i $$DEV_EXT -p udp -m multiport --dports 123,161 -j ACCEPT && # UDP: NTP, SNMP
+          iptables -A INPUT -i $$DEV_EXT -p tcp -m multiport --dports 21,2222,80,102 -j ACCEPT && # TCP: FTP, SSH, HTTP, IEC61850 (102)
+          # ====================================================
+
+          
+          
+          # 2. АТАКИ СНАРУЖИ: Перехватываем входящий (ingress) трафик от хакера (DEV_EXT) и копируем внутрь (DEV_INT)
+          tc qdisc add dev $$DEV_EXT handle ffff: ingress &&
+          tc filter add dev $$DEV_EXT parent ffff: protocol all u32 match u16 0x88b8 0xffff at 12 action mirred egress mirror dev $$DEV_INT &&
+          tc filter add dev $$DEV_EXT parent ffff: protocol all u32 match u16 0x88ba 0xffff at 12 action mirred egress mirror dev $$DEV_INT &&
+          
+          # 3. ОТВЕТЫ/ТРАФИК ИЗНУТРИ: Перехватываем исходящий (egress) трафик симулятора (DEV_INT) и копируем наружу (DEV_EXT)
+          tc qdisc add dev $$DEV_INT handle 1: root prio &&
+          tc filter add dev $$DEV_INT parent 1: protocol all u32 match u16 0x88b8 0xffff at 12 action mirred egress mirror dev $$DEV_EXT &&
+          tc filter add dev $$DEV_INT parent 1: protocol all u32 match u16 0x88ba 0xffff at 12 action mirred egress mirror dev $$DEV_EXT &&
+          
+          # 4. ЗАПУСК СЕРВЕРА (Привязываем к внутреннему интерфейсу)
+          # TCP порт 102 откроется везде автоматически (0.0.0.0)
+          /srv/libiec61850_server $$DEV_EXT 102 /cfg/IED4_SMV.cfg /cfg/IED4_SMV.ext R
+          "
+
+
+
+
+
+
+  simulator:
+    image: iec61850_vied_honeypot-simulator:latest 
+    container_name: simulator
+    hostname: simulator
+    privileged: true
+    cap_add:
+        - NET_RAW
+        - NET_ADMIN  
+        - SYS_PTRACE
+    volumes:
+      # Конфиги со схемами сети
+      - /home/artm1904/substation_honeypot/iec61850_vIED_honeypot/scd:/srv/scd
+
+      # логи beelzebub (ssh, web-server)
+      - ${TPOT_DATA_PATH}/substation/log/simulator/key:/opt/beelzebub/configurations/key
+      - ${TPOT_DATA_PATH}/substation/log/simulator/log:/opt/beelzebub/configurations/log
+
+      
+    networks:
+      subnetwork1:
+        ipv4_address: 10.0.0.254
+      scada_macvlan:
+        ipv4_address: 192.168.1.206
+    ports:
+        - "5010:5010"   # ИСПРАВЛЕНО!
+    security_opt:
+      - seccomp:unconfined
+    command: |
+      /bin/sh -c "
+            
+      # Определяем интерфейсы
+      DEV_INT=$$(ip -o -4 addr show | grep '10.0.0.254' | awk '{print $$2}') &&
+      DEV_EXT=$$(ip -o -4 addr show | grep '192.168.1.206' | awk '{print $$2}') &&
+
+      # Разрешаем интерфейсам принимать мультикаст (GOOSE/SV)
+      ip link set $$DEV_INT promisc on &&
+      ip link set $$DEV_EXT promisc on &&
+      
+      # Зеркалируем ИСХОДЯЩИЙ MMS-трафик (TCP порт 102) наружу
+      tc qdisc add dev $$DEV_INT handle 1: root prio &&
+      tc filter add dev $$DEV_INT parent 1: protocol ip u32 match ip protocol 6 0xff match ip dport 102 0xffff action mirred egress mirror dev $$DEV_EXT &&
+      tc filter add dev $$DEV_INT parent 1: protocol ip u32 match ip protocol 6 0xff match ip sport 102 0xffff action mirred egress mirror dev $$DEV_EXT &&
+      
+      # Зеркалируем ВХОДЯЩИЙ MMS-трафик наружу
+      tc qdisc add dev $$DEV_INT handle ffff: ingress &&
+      tc filter add dev $$DEV_INT parent ffff: protocol ip u32 match ip protocol 6 0xff match ip dport 102 0xffff action mirred egress mirror dev $$DEV_EXT &&
+      tc filter add dev $$DEV_INT parent ffff: protocol ip u32 match ip protocol 6 0xff match ip sport 102 0xffff action mirred egress mirror dev $$DEV_EXT &&
+      
+      # Запускаем штатный процесс
+      python3 webAPI.py
+      "
+
+
+
+  client:
+     image: iec61850_vied_honeypot-client:latest 
+     container_name: client
+     hostname: client
+     privileged: true
+     cap_add:
+         - NET_RAW
+         - NET_ADMIN
+     volumes:
+       # логи beelzebub (ssh, web-server)
+       - ${TPOT_DATA_PATH}/substation/log/client/key:/opt/beelzebub/configurations/key
+       - ${TPOT_DATA_PATH}/substation/log/client/log:/opt/beelzebub/configurations/log
+       - ${TPOT_DATA_PATH}/substation/log/client/:/tmp/
+
+
+       
+     networks:
+       subnetwork1:
+         ipv4_address: 10.0.0.11
+       scada_macvlan:
+         ipv4_address: 192.168.1.207
+     ports:
+       - "5000:5000"   # ИСПРАВЛЕНО!
+     command: |
+       /bin/sh -c "
+            
+       DEV_INT=$$(ip -o -4 addr show | grep '10.0.0.11' | awk '{print $$2}') &&
+       DEV_EXT=$$(ip -o -4 addr show | grep '192.168.1.207' | awk '{print $$2}') &&
+
+
+       # Разрешаем интерфейсам принимать мультикаст (GOOSE/SV)
+       ip link set $$DEV_INT promisc on &&
+       ip link set $$DEV_EXT promisc on &&
+
+
+       # ====================================================
+       # ВНУТРЕННИЙ ФАЕРВОЛ 
+       # ====================================================
+       iptables -F &&
+       iptables -P INPUT DROP &&
+       iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
+       iptables -A INPUT -i lo -j ACCEPT &&
+       iptables -A INPUT -i $$DEV_INT -j ACCEPT &&
+       iptables -A INPUT -i $$DEV_EXT -p icmp -j ACCEPT &&
+       iptables -A INPUT -i $$DEV_EXT -p tcp -m multiport --dports 21,2222,80,3389,5000,5900 -j ACCEPT && # TCP: FTP, SSH, HTTP, RDP, Web(5000), VNC
+       # ====================================================
+
+       
+       # Зеркалируем ИСХОДЯЩИЙ MMS-трафик наружу
+       tc qdisc add dev $$DEV_INT handle 1: root prio &&
+       tc filter add dev $$DEV_INT parent 1: protocol ip u32 match ip protocol 6 0xff match ip dport 102 0xffff action mirred egress mirror dev $$DEV_EXT &&
+       tc filter add dev $$DEV_INT parent 1: protocol ip u32 match ip protocol 6 0xff match ip sport 102 0xffff action mirred egress mirror dev $$DEV_EXT &&
+       
+       # Зеркалируем ВХОДЯЩИЙ MMS-трафик наружу
+       tc qdisc add dev $$DEV_INT handle ffff: ingress &&
+       tc filter add dev $$DEV_INT parent ffff: protocol ip u32 match ip protocol 6 0xff match ip dport 102 0xffff action mirred egress mirror dev $$DEV_EXT &&
+       tc filter add dev $$DEV_INT parent ffff: protocol ip u32 match ip protocol 6 0xff match ip sport 102 0xffff action mirred egress mirror dev $$DEV_EXT &&
+       
+       # Запускаем штатный процесс
+       python3 app.py -nD
+       "
+
+
+
+  attacker:
+    image: iec61850_vied_honeypot-attacker:latest  
+    container_name: attacker
+    hostname: attacker
+    networks:
+      subnetwork1:
+        ipv4_address: 10.0.0.66
+      scada_macvlan:
+        ipv4_address: 192.168.1.208
+    privileged: true
+    volumes:
+      - /home/artm1904/substation_honeypot/iec61850_vIED_honeypot/tests:/tests
+
+
+
+
+
+
+
+
+#########################################
+#### 🖥️ ИНТЕГРАЦИЯ УНИВЕРСАЛЬНЫХ ХАНИПОТОВ В SCADA
+#########################################
+
+  ied1_hp:
+    <<: *honeypots-base
+    container_name: ied1_honeypots
+    depends_on: [tpotinit, ied1_xcbr]
+    network_mode: "service:ied1_xcbr" # Привязываем к сети ied1
+    volumes:
+     - ${TPOT_DATA_PATH}/substation/log/ied1_xcbr/honeypots:/var/log/honeypots
+
+  ied2_hp:
+    <<: *honeypots-base
+    container_name: ied2_honeypots
+    depends_on: [tpotinit, ied2_ptoc]
+    network_mode: "service:ied2_ptoc" # Привязываем к сети ied2
+    volumes:
+     - ${TPOT_DATA_PATH}/substation/log/ied2_ptoc/honeypots:/var/log/honeypots
+
+  ied3_hp:
+    <<: *honeypots-base
+    container_name: ied3_honeypots
+    depends_on: [tpotinit, ied3_smv]
+    network_mode: "service:ied3_smv"
+    volumes:
+     - ${TPOT_DATA_PATH}/substation/log/ied3_smv/honeypots:/var/log/honeypots
+
+  ied4_hp:
+    <<: *honeypots-base
+    container_name: ied4_honeypots
+    depends_on: [tpotinit, ied4_smv]
+    network_mode: "service:ied4_smv"
+    volumes:
+     - ${TPOT_DATA_PATH}/substation/log/ied4_smv/honeypots:/var/log/honeypots
+
+  client_hp:
+    <<: *honeypots-base
+    container_name: client_honeypots
+    depends_on: [tpotinit, client]
+    network_mode: "service:client"
+    volumes:
+     - ${TPOT_DATA_PATH}/substation/log/client/honeypots:/var/log/honeypots
+
+
+
+
+
+
+
+
+
+
+
+
+
+##################
+#### NSM
+##################
+
+# Fatt service
+  fatt:
+    container_name: fatt
+    restart: always
+    depends_on:
+      tpotinit:
+        condition: service_healthy
+    network_mode: "host"
+    cap_add:
+     - NET_ADMIN
+     - SYS_NICE
+     - NET_RAW
+    image: ${TPOT_REPO}/fatt:${TPOT_VERSION}
+    pull_policy: ${TPOT_PULL_POLICY}
+    volumes:
+     - ${TPOT_DATA_PATH}/fatt/log:/opt/fatt/log
+
+# P0f service
+  p0f:
+    container_name: p0f
+    restart: always
+    depends_on:
+      tpotinit:
+        condition: service_healthy
+    network_mode: "host"
+    image: ${TPOT_REPO}/p0f:${TPOT_VERSION}
+    pull_policy: ${TPOT_PULL_POLICY}
+    read_only: true
+    volumes:
+     - ${TPOT_DATA_PATH}/p0f/log:/var/log/p0f
+
+# Suricata service
+  suricata:
+    container_name: suricata
+    restart: always
+    depends_on:
+      tpotinit:
+        condition: service_healthy
+    environment:
+     - OINKCODE=${OINKCODE:-OPEN} # Default to OPEN if unset or NULL (value provided by T-Pot .env)
+    # Loading external Rules from URL
+    # - FROMURL="https://username:password@yoururl.com|https://username:password@otherurl.com"
+    network_mode: "host"
+    cap_add:
+     - NET_ADMIN
+     - SYS_NICE
+     - NET_RAW
+    image: ${TPOT_REPO}/suricata:${TPOT_VERSION}
+    pull_policy: ${TPOT_PULL_POLICY}
+    volumes:
+     - ${TPOT_DATA_PATH}/suricata/log:/var/log/suricata
+
+
+##################
+#### Tools 
+##################
+
+#### ELK
+
+## Logstash service
+  logstash:
+    container_name: logstash
+    restart: always
+    depends_on:
+      tpotinit:
+        condition: service_healthy
+    environment:
+     - LS_JAVA_OPTS=-Xms1024m -Xmx1024m
+     - TPOT_TYPE=${TPOT_TYPE:-HIVE}
+     - TPOT_HIVE_USER=${TPOT_HIVE_USER}
+     - TPOT_HIVE_IP=${TPOT_HIVE_IP}
+     - LS_SSL_VERIFICATION=${LS_SSL_VERIFICATION:-full}
+    ports:
+     - "127.0.0.1:64305:64305"
+    mem_limit: 2g
+    image: ${TPOT_REPO}/logstash:${TPOT_VERSION}
+    pull_policy: ${TPOT_PULL_POLICY}
+    volumes:
+     - ${TPOT_DATA_PATH}:/data
+     - /home/artm1904/substation_honeypot/custom_http_output.conf:/etc/logstash/http_output.conf:ro
+
+#### /ELK
